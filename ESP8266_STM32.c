@@ -4,7 +4,8 @@ ESP8266_ConnectionState ESP_ConnState = ESP8266_DISCONNECTED;   // Default state
 static char esp_rx_buffer[2048];
 static ESP8266_Status ESP_GetIP(char *ip_buffer, uint16_t buffer_len);
 static ESP8266_Status ESP_SendCommand(const char *cmd, const char *ack, uint32_t timeout);
-static ESP8266_Status ESP_SendCommandWiFi(const char *cmd, uint32_t timeout);
+
+static uint8_t current_connection_id = 0;
 
 ESP8266_Status ESP_Init(void)
 {
@@ -217,109 +218,241 @@ static ESP8266_Status ESP_SendCommand(const char *cmd, const char *ack, uint32_t
     return ESP8266_TIMEOUT;
 }
 
-static ESP8266_Status ESP_SendCommandWiFi(const char *cmd, uint32_t timeout)
+ESP8266_Status ESP_StartWebServer(uint16_t port)
+{
+    char cmd[64];
+    ESP8266_Status result;
+
+    USER_LOG("Starting Web Server on port %d...", port);
+
+    // Enable multiple connections
+    result = ESP_SendCommand("AT+CIPMUX=1\r\n", "OK", 2000);
+    if (result != ESP8266_OK)
+    {
+        DEBUG_LOG("Failed to enable multiple connections");
+        return result;
+    }
+
+    // Start TCP server
+    snprintf(cmd, sizeof(cmd), "AT+CIPSERVER=1,%d\r\n", port);
+    result = ESP_SendCommand(cmd, "OK", 2000);
+    if (result != ESP8266_OK)
+    {
+        DEBUG_LOG("Failed to start server");
+        return result;
+    }
+
+    // Set timeout for server
+    result = ESP_SendCommand("AT+CIPSTO=180\r\n", "OK", 2000);
+    if (result != ESP8266_OK)
+    {
+        DEBUG_LOG("Failed to set timeout");
+        return result;
+    }
+
+    USER_LOG("Web Server Started Successfully!");
+    return ESP8266_OK;
+}
+
+ESP8266_Status ESP_CheckForClient(char *request_buffer, uint16_t buffer_len)
 {
     uint8_t ch;
     uint16_t idx = 0;
-    uint32_t tickstart;
-    int got_ok = 0;
-    int got_wifi_connected = 0;
+    static uint32_t last_data_log = 0;
 
-    memset(esp_rx_buffer, 0, sizeof(esp_rx_buffer));
-    tickstart = HAL_GetTick();
+    memset(request_buffer, 0, buffer_len);
 
-    DEBUG_LOG("Sending WiFi command: %s", cmd);
-    if (HAL_UART_Transmit(&ESP_UART, (uint8_t*)cmd, strlen(cmd), HAL_MAX_DELAY) != HAL_OK)
-        return ESP8266_ERROR;
-
-    // Keep reading until timeout
-    while ((HAL_GetTick() - tickstart) < timeout && idx < sizeof(esp_rx_buffer) - 1)
+    // First, do a quick check if ANY data is available
+    if (HAL_UART_Receive(&ESP_UART, &ch, 1, 1) != HAL_OK)
     {
-        if (HAL_UART_Receive(&ESP_UART, &ch, 1, 100) == HAL_OK)
+        return ESP8266_NO_RESPONSE;  // No data at all
+    }
+
+    // Data is available! Store first byte
+    request_buffer[idx++] = ch;
+    request_buffer[idx] = '\0';
+
+    // Now read continuously with longer timeout per byte
+    // Keep reading as long as we keep getting data
+    uint32_t last_byte_time = HAL_GetTick();
+
+    while (idx < buffer_len - 1)
+    {
+        // Wait up to 200ms for next byte
+        if (HAL_UART_Receive(&ESP_UART, &ch, 1, 200) == HAL_OK)
         {
-            esp_rx_buffer[idx++] = ch;
-            esp_rx_buffer[idx]   = '\0';
+            request_buffer[idx++] = ch;
+            request_buffer[idx] = '\0';
+            last_byte_time = HAL_GetTick();
+        }
+        else
+        {
+            // No more data for 200ms - we're done
+            break;
+        }
 
-            // Check for OK
-            if (!got_ok && strstr(esp_rx_buffer, "OK"))
-            {
-                DEBUG_LOG("Got OK response - continuing to wait for connection status...");
-                got_ok = 1;
-                // Don't break, keep waiting for WIFI CONNECTED
-            }
+        // Safety timeout - if we've been reading for more than 2 seconds, stop
+        if ((HAL_GetTick() - last_byte_time + 200) > 2000)
+        {
+            DEBUG_LOG("Safety timeout after %d bytes", idx);
+            break;
+        }
+    }
 
-            // Check for WIFI CONNECTED or WIFI GOT IP
-            if (strstr(esp_rx_buffer, "WIFI CONNECTED") || strstr(esp_rx_buffer, "WIFI GOT IP"))
+    if (idx > 0)
+    {
+        DEBUG_LOG("=== Received %d bytes ===", idx);
+        DEBUG_LOG("Full data: %s", request_buffer);
+
+        // Check for connection notification
+        if (strstr(request_buffer, ",CONNECT"))
+        {
+            DEBUG_LOG("Found CONNECT message");
+
+            // Extract connection ID (digit before ,CONNECT)
+            char *conn_ptr = strstr(request_buffer, ",CONNECT");
+            if (conn_ptr && conn_ptr > request_buffer)
             {
-                DEBUG_LOG("WiFi connection confirmed!");
-                got_wifi_connected = 1;
-                // Keep reading a bit more to get the full message
-                uint32_t extra_wait = HAL_GetTick();
-                while ((HAL_GetTick() - extra_wait) < 500 && idx < sizeof(esp_rx_buffer) - 1)
+                char prev_char = *(conn_ptr - 1);
+                if (prev_char >= '0' && prev_char <= '9')
                 {
-                    if (HAL_UART_Receive(&ESP_UART, &ch, 1, 10) == HAL_OK)
-                    {
-                        esp_rx_buffer[idx++] = ch;
-                        esp_rx_buffer[idx] = '\0';
-                    }
+                    current_connection_id = prev_char - '0';
+                    DEBUG_LOG("Connection ID: %d", current_connection_id);
+                    return ESP8266_OK;
                 }
-                break; // Success!
+            }
+        }
+
+        // Check for +IPD data
+        if (strstr(request_buffer, "+IPD,"))
+        {
+            DEBUG_LOG("Found +IPD message");
+
+            char *id_ptr = strstr(request_buffer, "+IPD,");
+            if (id_ptr && id_ptr[5] >= '0' && id_ptr[5] <= '9')
+            {
+                current_connection_id = id_ptr[5] - '0';
+                DEBUG_LOG("Connection ID: %d", current_connection_id);
+                return ESP8266_OK;
+            }
+        }
+
+        // Check if it's just a connection ID by itself
+        if (idx >= 1 && idx <= 3 && request_buffer[0] >= '0' && request_buffer[0] <= '9')
+        {
+            current_connection_id = request_buffer[0] - '0';
+            DEBUG_LOG("Got connection ID alone: %d", current_connection_id);
+
+            // Continue reading to get more data
+            uint32_t extra_start = HAL_GetTick();
+            while ((HAL_GetTick() - extra_start) < 1000 && idx < buffer_len - 1)
+            {
+                if (HAL_UART_Receive(&ESP_UART, &ch, 1, 100) == HAL_OK)
+                {
+                    request_buffer[idx++] = ch;
+                    request_buffer[idx] = '\0';
+                    extra_start = HAL_GetTick(); // Reset timer
+                }
             }
 
-            // Check for failure
-            if (strstr(esp_rx_buffer, "FAIL"))
+            DEBUG_LOG("After waiting, total: %d bytes", idx);
+            DEBUG_LOG("Data now: %s", request_buffer);
+
+            // Check again for CONNECT or +IPD
+            if (strstr(request_buffer, "CONNECT") || strstr(request_buffer, "+IPD"))
             {
-                DEBUG_LOG("Connection FAILED");
-                DEBUG_LOG("Full response: %s", esp_rx_buffer);
-                return ESP8266_ERROR;
+                return ESP8266_OK;
+            }
+        }
+
+        // Log unrecognized format occasionally
+        if (HAL_GetTick() - last_data_log > 3000)
+        {
+            DEBUG_LOG("Unrecognized format (throttled logging)");
+            last_data_log = HAL_GetTick();
+        }
+    }
+
+    return ESP8266_NO_RESPONSE;
+}
+
+ESP8266_Status ESP_SendWebPage(const char *html_content)
+{
+    char cmd[128];
+    uint16_t content_len = strlen(html_content);
+
+    DEBUG_LOG("Sending web page (%d bytes)...", content_len);
+
+    // Prepare to send data
+    snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%d,%d\r\n", current_connection_id, content_len);
+
+    // Clear any pending data first
+    uint8_t dummy;
+    while (HAL_UART_Receive(&ESP_UART, &dummy, 1, 1) == HAL_OK);
+
+    // Send CIPSEND and wait for ">"
+    DEBUG_LOG("Sending: %s", cmd);
+    if (HAL_UART_Transmit(&ESP_UART, (uint8_t*)cmd, strlen(cmd), 1000) != HAL_OK)
+    {
+        DEBUG_LOG("Failed to send command");
+        return ESP8266_ERROR;
+    }
+
+    // Wait for ">" prompt
+    uint8_t ch;
+    uint32_t start = HAL_GetTick();
+    char rx_buf[64] = {0};
+    int rx_idx = 0;
+
+    while ((HAL_GetTick() - start) < 3000 && rx_idx < 63)
+    {
+        if (HAL_UART_Receive(&ESP_UART, &ch, 1, 10) == HAL_OK)
+        {
+            rx_buf[rx_idx++] = ch;
+            rx_buf[rx_idx] = '\0';
+
+            if (ch == '>')
+            {
+                DEBUG_LOG("Got prompt, sending data");
+                HAL_Delay(10);
+
+                // Send HTML
+                if (HAL_UART_Transmit(&ESP_UART, (uint8_t*)html_content, content_len, 5000) != HAL_OK)
+                {
+                    DEBUG_LOG("Failed to send HTML");
+                    return ESP8266_ERROR;
+                }
+
+                DEBUG_LOG("HTML sent successfully");
+                HAL_Delay(100);
+                return ESP8266_OK;
             }
 
-            // Check for specific error codes
-            if (strstr(esp_rx_buffer, "+CWJAP:1"))
+            // Check for ERROR
+            if (strstr(rx_buf, "ERROR"))
             {
-                DEBUG_LOG("Error: Connection timeout");
+                DEBUG_LOG("Got ERROR response: %s", rx_buf);
                 return ESP8266_ERROR;
-            }
-            if (strstr(esp_rx_buffer, "+CWJAP:2"))
-            {
-                DEBUG_LOG("Error: Wrong password");
-                return ESP8266_ERROR;
-            }
-            if (strstr(esp_rx_buffer, "+CWJAP:3"))
-            {
-                DEBUG_LOG("Error: Cannot find target AP");
-                return ESP8266_ERROR;
-            }
-            if (strstr(esp_rx_buffer, "+CWJAP:4"))
-            {
-                DEBUG_LOG("Error: Connection failed");
-                return ESP8266_ERROR;
-            }
-
-            // Handle busy response
-            if (strstr(esp_rx_buffer, "busy"))
-            {
-                DEBUG_LOG("ESP is busy... waiting");
-                HAL_Delay(1000);
             }
         }
     }
 
-    DEBUG_LOG("Buffer contents (%d bytes):", idx);
-    DEBUG_LOG("%s", esp_rx_buffer);
-
-    if (got_wifi_connected)
-    {
-        return ESP8266_OK;
-    }
-
-    if (got_ok && !got_wifi_connected)
-    {
-        DEBUG_LOG("Got OK but no WIFI CONNECTED - may need more time");
-        DEBUG_LOG("Check: 1) WiFi credentials 2) AP is in range 3) AP is on");
-        return ESP8266_TIMEOUT;
-    }
-
-    DEBUG_LOG("Timeout waiting for WiFi connection");
+    DEBUG_LOG("Timeout waiting for prompt. Received: %s", rx_buf);
     return ESP8266_TIMEOUT;
+}
+
+ESP8266_Status ESP_CloseConnection(void)
+{
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "AT+CIPCLOSE=%d\r\n", current_connection_id);
+
+    DEBUG_LOG("Closing connection %d", current_connection_id);
+
+    // Send close command
+    HAL_UART_Transmit(&ESP_UART, (uint8_t*)cmd, strlen(cmd), 1000);
+
+    // Give it time to close
+    HAL_Delay(50);
+
+    return ESP8266_OK;
 }
