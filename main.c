@@ -107,7 +107,7 @@ int main(void)
     }
 
     // Connect to WiFi
-    if (ESP_ConnectWiFi("ATT6rWYCTA", "eais66v+nmeh", ip_buf, sizeof(ip_buf)) != ESP8266_OK){
+    if (ESP_ConnectWiFi("SSID", "PASSWORD", ip_buf, sizeof(ip_buf)) != ESP8266_OK){
         USER_LOG("Failed to connect to wifi.. Check Debug Log");
         SSD1306_Fill(0);
         SSD1306_GotoXY(10, 25);
